@@ -3,19 +3,21 @@
 package main
 
 import (
-	"log"
-	_ "github.com/jmoiron/sqlx"
-	_ "github.com/pkg/errors"
-	_ "github.com/go-sql-driver/mysql"
-	_ "github.com/joho/godotenv/autoload"
-	"fmt"
+	"bytes"
+	"database/sql"
 	"encoding/json"
+	"fmt"
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/google/go-querystring/query"
+	"github.com/jmoiron/sqlx"
+	_ "github.com/jmoiron/sqlx"
+	_ "github.com/joho/godotenv/autoload"
+	_ "github.com/pkg/errors"
+	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
-	"bytes"
-	"io/ioutil"
-	"github.com/jmoiron/sqlx"
-	"database/sql"
+	"strings"
 	"time"
 )
 
@@ -66,7 +68,6 @@ func main() {
 	user := os.Getenv("CIVI_USER")
 	if user == "" {
 		log.Fatalf("Unable to connect without username\n")
-		os.Exit(2)
 	}
 	password := os.Getenv("CIVI_PASSWORD")
 	if password == "" {
@@ -123,7 +124,7 @@ func OpenDb(host string, user string, password string, protocol string, dbName s
 }
 
 func closeDb(db *sqlx.DB) {
-	db.Close()
+	_ = db.Close()
 }
 
 func isTableExists(db *sqlx.DB, dbName string, tableName string) (exists bool) {
@@ -194,7 +195,7 @@ WHERE
 		// Read messages from DB
 		err = rows.StructScan(&contribution)
 		if err != nil {
-			log.Fatalf("Table  access error: %v\n", err)
+			log.Fatalf("Table access error: %v\n", err)
 		}
 
 		// Submit 2 priority
@@ -203,6 +204,9 @@ WHERE
 		// Update Reported2prio in case of success
 		updateReported2prio(markAsDone, contribution.ID)
 		totalPaymentsRead++
+
+		// Submit 2 good_url, just to be sure
+		submit2goodUrl(db, contribution.ID)
 	}
 
 	fmt.Printf("Total of %d payments were transferred to Priority\n", totalPaymentsRead)
@@ -211,13 +215,76 @@ WHERE
 func timeIn(from string, name string) string {
 	loc, err := time.LoadLocation(name)
 	if err != nil {
-		return from;
+		return from
 	}
 	t, err := time.Parse("2006-01-02 15:04:05", from)
 	if err != nil {
-		return from;
+		return from
 	}
 	return t.In(loc).Format("2006-01-02 15:04:05")
+}
+
+// http://books.kab.co.il/?wc-api=WC_Gateway_BB_Payments&success=additional_details_param_x=66bb12561&card_hebrew_name=laC+%29%D7%95%D7%99%D7%96%D7%94%28&confirmation_key=4a48fbce1cba4063b41d2277accc98a8&credit_card_abroad_card=0&credit_card_brand=2&credit_card_company_clearer=1&credit_card_company_issuer=2&credit_card_exp_date=1119&credit_card_number=458098%2A%2A%2A%2A%2A%2A3117&credit_type=1&debit_code=50&debit_currency=1&debit_total=3500&debit_type=2&first_payment_total=0&fixed_payment_total=0&j_param=4&station_number=100&total_payments=1&transaction_id=0f1a70f5-f087-4e8e-bf1a-573f7ebd6fca&transaction_init_time=02%2F07%2F2019+10%3A09%3A14&transaction_pelecard_id=495698982&transaction_update_time=02%2F07%2F2019+10%3A09%3A25&user_key=66bb-wc_order_5d1b0319b9a8a-12561&voucher_id=64-100-018
+func submit2goodUrl(db *sqlx.DB, id string) {
+	var userKey string
+	var goodUrl string
+
+	err := db.QueryRow("SELECT user_key, good_url FROM bb_ext_requests WHERE id = "+id+" ORDER BY created_at DESC LIMIT 1").Scan(&userKey, &goodUrl)
+	if err != nil {
+		fmt.Println("Unable to find record in bb_ext_requests with id='" + id + "': " + err.Error())
+		return
+	}
+
+	type PaymentResponse struct {
+		UserKey                  string `db:"user_key" url:"user_key"`
+		TransactionId            string `db:"transaction_id" url:"transaction_id"`
+		CardHebrewName           string `db:"card_hebrew_name" url:"card_hebrew_name"`
+		TransactionUpdateTime    string `db:"transaction_update_time" url:"transaction_update_time"`
+		CreditCardAbroadCard     string `db:"credit_card_abroad_card" url:"credit_card_abroad_card"`
+		FirstPaymentTotal        string `db:"first_payment_total" url:"first_payment_total"`
+		CreditType               string `db:"credit_type" url:"credit_type"`
+		CreditCardBrand          string `db:"credit_card_brand" url:"credit_card_brand"`
+		VoucherId                string `db:"voucher_id" url:"voucher_id"`
+		StationNumber            string `db:"station_number" url:"station_number"`
+		AdditionalDetailsParamX  string `db:"additional_details_param_x" url:"additional_details_param_x"`
+		CreditCardCompanyIssuer  string `db:"credit_card_company_issuer" url:"credit_card_company_issuer"`
+		DebitCode                string `db:"debit_code" url:"debit_code"`
+		FixedPaymentTotal        string `db:"fixed_payment_total" url:"fixed_payment_total"`
+		CreditCardNumber         string `db:"credit_card_number" url:"credit_card_number"`
+		CreditCardExpDate        string `db:"credit_card_exp_date" url:"credit_card_exp_date"`
+		CreditCardCompanyClearer string `db:"credit_card_company_clearer" url:"credit_card_company_clearer"`
+		ConfirmationKey          string `db:"-" url:"confirmation_key"`
+		DebitTotal               string `db:"debit_total" url:"debit_total"`
+		TotalPayments            string `db:"total_payments" url:"total_payments"`
+		DebitType                string `db:"debit_type" url:"debit_type"`
+		TransactionInitTime      string `db:"transaction_init_time" url:"transaction_init_time"`
+		JParam                   string `db:"j_param" url:"j_param"`
+		TransactionPelecardId    string `db:"transaction_pelecard_id" url:"transaction_pelecard_id"`
+		DebitCurrency            string `db:"debit_currency" url:"debit_currency"`
+	}
+
+	response := PaymentResponse{}
+	err = db.Get(&response, "SELECT * FROM bb_ext_payment_responses WHERE user_key = '" + userKey + "' ORDER BY transaction_update_time DESC LIMIT 1")
+	if err != nil {
+		fmt.Println("Unable to find record in bb_ext_payment_responses with user_key='" + userKey + "': " + err.Error())
+		return
+	}
+
+	v, _ := query.Values(response)
+	var q string
+	if strings.ContainsRune(goodUrl, '?') {
+		q = "&"
+	} else {
+		q = "?"
+	}
+
+	target := fmt.Sprintf("%s%ssuccess=1&%s", goodUrl, q, v)
+	resp, err := http.Get(target)
+	if err != nil {
+		fmt.Println("Unable access site for user_key='" + userKey + "'")
+		return
+	}
+	defer resp.Body.Close()
 }
 
 func submit2priority(contribution Contribution) {
